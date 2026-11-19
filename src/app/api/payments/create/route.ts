@@ -1,172 +1,82 @@
 import { NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import Stripe from "stripe";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
 
-const supabaseAdmin =
-  supabaseUrl && supabaseServiceRoleKey
-    ? createClient(supabaseUrl, supabaseServiceRoleKey)
-    : null;
+const PRICES_BY_CURRENCY: Record<string, { unitAmount: number; currency: string }> = {
+  usd: { unitAmount: 1900, currency: "usd" }, // $19.00
+  rub: { unitAmount: 179000, currency: "rub" }, // 1790.00 RUB
+  byn: { unitAmount: 6500, currency: "byn" }, // 65.00 BYN
+};
+
+function getAppUrl(req: Request): string {
+  const origin = req.headers.get("origin");
+  if (origin && origin.startsWith("http")) {
+    return origin.replace(/\/$/, "");
+  }
+  const host = req.headers.get("x-forwarded-host") || req.headers.get("host");
+  if (host) {
+    const proto = req.headers.get("x-forwarded-proto") || "https";
+    return `${proto}://${host}`;
+  }
+  return "https://review-ai.site";
+}
 
 export async function POST(req: Request) {
   try {
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
+    if (!stripe) {
       return NextResponse.json(
-        { error: "Не найден GROQ_API_KEY в переменных окружения" },
+        { error: "Не настроен STRIPE_SECRET_KEY" },
         { status: 500 }
       );
     }
 
-    if (!supabaseAdmin) {
-      return NextResponse.json(
-        { error: "Не настроены NEXT_PUBLIC_SUPABASE_URL или SUPABASE_SERVICE_ROLE_KEY" },
-        { status: 500 }
-      );
-    }
-
-    const body = await req.json();
-    const { type, text, tone, keywords, email } = body as {
-      type?: "reply" | "analysis";
-      text?: string;
-      tone?: "friendly" | "formal" | "apology";
-      keywords?: string;
-      email?: string;
-    };
-
-    const normalizedEmail = (email || "").trim().toLowerCase();
-    if (!normalizedEmail) {
-      return NextResponse.json(
-        { error: "Не передан email пользователя. Войдите в аккаунт заново." },
-        { status: 401 }
-      );
-    }
-
-    if (!text || !text.trim()) {
-      return NextResponse.json(
-        { error: "Передайте текст отзыва или список отзывов для обработки." },
-        { status: 400 }
-      );
-    }
-
-    // 1. Получаем или создаём профиль пользователя в Supabase
-    let { data: profile, error: fetchError } = await supabaseAdmin
-      .from("profiles")
-      .select("email, plan, credits")
-      .eq("email", normalizedEmail)
-      .maybeSingle();
-
-    if (fetchError) {
-      return NextResponse.json(
-        { error: `Ошибка чтения профиля из Supabase: ${fetchError.message}` },
-        { status: 500 }
-      );
-    }
-
-    if (!profile) {
-      const { data: created, error: insertError } = await supabaseAdmin
-        .from("profiles")
-        .insert({
-          email: normalizedEmail,
-          plan: "free",
-          credits: 10,
-        })
-        .select("email, plan, credits")
-        .single();
-
-      if (insertError || !created) {
-        return NextResponse.json(
-          { error: `Не удалось создать профиль в Supabase: ${insertError?.message}` },
-          { status: 500 }
-        );
+    let body: { currency?: string; email?: string; userId?: string; credits?: number } = {};
+    try {
+      const raw = await req.text();
+      if (raw) {
+        body = JSON.parse(raw);
       }
-      profile = created;
+    } catch {
+      body = {};
     }
 
-    // 2. Проверяем остаток кредитов на сервере
-    if (profile.credits <= 0) {
-      return NextResponse.json(
+    const currencyKey = String(body.currency || "usd").toLowerCase();
+    const priceConfig = PRICES_BY_CURRENCY[currencyKey] || PRICES_BY_CURRENCY.usd;
+    const appUrl = getAppUrl(req);
+    const credits = Number(body.credits) > 0 ? Number(body.credits) : 999;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      ...(body.email ? { customer_email: body.email } : {}),
+      line_items: [
         {
-          error: "Бесплатные запросы закончились. Перейдите на тариф PRO.",
-          code: "NO_CREDITS",
-          credits: 0,
-          plan: profile.plan,
+          price_data: {
+            currency: priceConfig.currency,
+            unit_amount: priceConfig.unitAmount,
+            product_data: {
+              name: "ReviewAI PRO",
+              description: "Тариф PRO и начисление кредитов ReviewAI",
+            },
+          },
+          quantity: 1,
         },
-        { status: 403 }
-      );
-    }
-
-    const toneInstruction =
-      tone === "friendly"
-        ? "Тон: теплый, дружелюбный, с легкой заботой о клиенте."
-        : tone === "formal"
-        ? "Тон: вежливый, деловой и официальный."
-        : "Тон: максимально эмпатичный, извиняющийся, направленный на сглаживание конфликта и возврат доверия покупателя.";
-
-    const systemPrompt =
-      type === "reply"
-        ? `Ты — опытный менеджер по работе с клиентами и SEO-специалист маркетплейсов (Wildberries, Ozon, Amazon). Напиши грамотный, живой и естественный ответ продавца на отзыв покупателя на русском языке. ${toneInstruction} Органично вплети в текст ключевые слова: "${keywords || ""}". Отвечай без воды, только сам текст ответа.`
-        : `Ты — старший бизнес-аналитик маркетплейсов и e-commerce. Проанализируй переданный список отзывов покупателей (своих или конкурента) на русском языке. Выдай четкий, структурированный отчет с эмодзи:
-1. ✅ Главные плюсы (за что хвалят).
-2. ⚠️ Главные боли и причины негатива/возвратов.
-3. 🚀 3 конкретных шага, как улучшить товар, карточку или сервис, чтобы обойти конкурентов и поднять продажи.
-Учитывай контекст ключевых слов: "${keywords || ""}".`;
-
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+      ],
+      metadata: {
+        plan: "pro",
+        credits: String(credits),
+        ...(body.email ? { email: body.email } : {}),
+        ...(body.userId ? { userId: body.userId } : {}),
       },
-      body: JSON.stringify({
-        model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: text },
-        ],
-        temperature: 0.7,
-        max_tokens: 1024,
-      }),
+      success_url: `${appUrl}/?payment=success`,
+      cancel_url: `${appUrl}/?payment=cancel`,
     });
 
-    const data = await response.json();
-
-    if (!response.ok) {
-      return NextResponse.json(
-        { error: data.error?.message || "Ошибка при обращении к Groq API" },
-        { status: response.status }
-      );
-    }
-
-    const result = data.choices?.[0]?.message?.content || "Не удалось получить ответ от ИИ.";
-
-    // 3. Списываем 1 кредит в Supabase после успешной генерации
-    const nextCredits = Math.max(0, profile.credits - 1);
-    const { error: updateError } = await supabaseAdmin
-      .from("profiles")
-      .update({
-        credits: nextCredits,
-        updated_at: new Date().toISOString(),
-      })
-      .eq("email", normalizedEmail);
-
-    if (updateError) {
-      return NextResponse.json(
-        { error: `Ошибка обновления кредитов: ${updateError.message}` },
-        { status: 500 }
-      );
-    }
-
-    return NextResponse.json({
-      result,
-      credits: nextCredits,
-      plan: profile.plan,
-    });
-  } catch {
-    return NextResponse.json(
-      { error: "Внутренняя ошибка сервера при генерации." },
-      { status: 500 }
-    );
+    return NextResponse.json({ url: session.url, id: session.id }, { status: 200 });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Ошибка создания сессии оплаты";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
