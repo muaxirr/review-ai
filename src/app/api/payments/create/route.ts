@@ -32,7 +32,14 @@ export async function POST(req: Request) {
       );
     }
 
-    let body: { currency?: string; email?: string; userId?: string; credits?: number } = {};
+    let body: {
+      currency?: string;
+      email?: string;
+      userId?: string;
+      credits?: number;
+      plan?: string;
+    } = {};
+
     try {
       const raw = await req.text();
       if (raw) {
@@ -46,6 +53,7 @@ export async function POST(req: Request) {
     const priceConfig = PRICES_BY_CURRENCY[currencyKey] || PRICES_BY_CURRENCY.usd;
     const appUrl = getAppUrl(req);
     const credits = Number(body.credits) > 0 ? Number(body.credits) : 999;
+    const plan = body.plan || "pro";
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -64,7 +72,7 @@ export async function POST(req: Request) {
         },
       ],
       metadata: {
-        plan: "pro",
+        plan,
         credits: String(credits),
         ...(body.email ? { email: body.email } : {}),
         ...(body.userId ? { userId: body.userId } : {}),
@@ -73,7 +81,14 @@ export async function POST(req: Request) {
       cancel_url: `${appUrl}/?payment=cancel`,
     });
 
-    return NextResponse.json({ url: session.url, id: session.id }, { status: 200 });
+    return NextResponse.json(
+      {
+        url: session.url,
+        checkoutUrl: session.url,
+        id: session.id,
+      },
+      { status: 200 }
+    );
   } catch (err) {
     const message = err instanceof Error ? err.message : "Ошибка создания сессии оплаты";
     return NextResponse.json({ error: message }, { status: 500 });
