@@ -18,6 +18,7 @@ import {
   LogOut,
   X,
   User,
+  CreditCard,
 } from "lucide-react";
 
 type HistoryItem = {
@@ -29,8 +30,17 @@ type HistoryItem = {
 };
 
 type UserAccount = {
+  id?: string;
   email: string;
   plan: "free" | "pro";
+};
+
+type CurrencyOption = "USD" | "RUB" | "BYN";
+
+const PRO_PRICES: Record<CurrencyOption, { amount: string; label: string }> = {
+  USD: { amount: "$19", label: "$19 / месяц" },
+  RUB: { amount: "1 790 ₽", label: "1 790 ₽ / месяц" },
+  BYN: { amount: "62 BYN", label: "62 BYN / месяц" },
 };
 
 export default function ReviewAIApp() {
@@ -52,17 +62,48 @@ export default function ReviewAIApp() {
   const [isLoading, setIsLoading] = useState(false);
   const [copied, setCopied] = useState(false);
   const [credits, setCredits] = useState(10);
+
+  // Состояние окна оплаты PRO
   const [showPaywall, setShowPaywall] = useState(false);
+  const [currency, setCurrency] = useState<CurrencyOption>("USD");
+  const [isPaymentLoading, setIsPaymentLoading] = useState(false);
+  const [paymentError, setPaymentError] = useState("");
+
   const [history, setHistory] = useState<HistoryItem[]>([]);
 
-  // Восстановление сессии и данных из памяти браузера
+  const syncProfile = async (email: string) => {
+    try {
+      const res = await fetch(`/api/profile?email=${encodeURIComponent(email)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (typeof data.credits === "number") {
+        setCredits(data.credits);
+        localStorage.setItem("reviewai_credits", String(data.credits));
+      }
+      if (data.plan === "pro" || data.plan === "free") {
+        setUser((prev) => {
+          if (!prev) return prev;
+          const updated = { ...prev, plan: data.plan };
+          localStorage.setItem("reviewai_user", JSON.stringify(updated));
+          return updated;
+        });
+      }
+    } catch {
+      // Игнорируем сетевую ошибку при фоновой синхронизации
+    }
+  };
+
   useEffect(() => {
     const savedUser = localStorage.getItem("reviewai_user");
     const savedCredits = localStorage.getItem("reviewai_credits");
     const savedHistory = localStorage.getItem("reviewai_history");
-    if (savedUser) setUser(JSON.parse(savedUser));
     if (savedCredits) setCredits(Number(savedCredits));
     if (savedHistory) setHistory(JSON.parse(savedHistory));
+    if (savedUser) {
+      const parsed: UserAccount = JSON.parse(savedUser);
+      setUser(parsed);
+      syncProfile(parsed.email);
+    }
   }, []);
 
   const openAuth = (mode: "login" | "register") => {
@@ -88,6 +129,47 @@ export default function ReviewAIApp() {
     localStorage.removeItem("reviewai_user");
   };
 
+  const handleStartCheckout = async () => {
+    if (!user) {
+      setShowPaywall(false);
+      openAuth("register");
+      return;
+    }
+
+    setIsPaymentLoading(true);
+    setPaymentError("");
+
+    try {
+      const res = await fetch("/api/payments/create", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: user.email,
+          currency,
+          plan: "pro",
+          returnUrl: "https://review-ai.site",
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok || !data.checkoutUrl) {
+        setPaymentError(
+          data.error ||
+            "Платёжный шлюз ещё не настроен на сервере. Добавьте ключи провайдера в переменные окружения."
+        );
+        setIsPaymentLoading(false);
+        return;
+      }
+
+      // Перенаправляем пользователя на защищённую страницу/форму оплаты с вводом карты
+      window.location.href = data.checkoutUrl;
+    } catch {
+      setPaymentError("Не удалось запустить оплату. Проверьте соединение и серверные маршруты.");
+      setIsPaymentLoading(false);
+    }
+  };
+
   const handleGenerate = async () => {
     if (!inputText.trim()) return;
     if (credits <= 0) {
@@ -107,6 +189,7 @@ export default function ReviewAIApp() {
           text: inputText,
           tone,
           keywords,
+          email: user?.email,
         }),
       });
 
@@ -120,7 +203,7 @@ export default function ReviewAIApp() {
 
       setOutputText(data.result);
 
-      const nextCredits = credits - 1;
+      const nextCredits = Math.max(0, credits - 1);
       setCredits(nextCredits);
       localStorage.setItem("reviewai_credits", String(nextCredits));
 
@@ -137,7 +220,7 @@ export default function ReviewAIApp() {
       setHistory(newHistory);
       localStorage.setItem("reviewai_history", JSON.stringify(newHistory));
     } catch {
-      setErrorText("Не удалось связаться с сервером. Убедитесь, что npm run dev запущен.");
+      setErrorText("Не удалось связаться с сервером. Проверьте работу API.");
     } finally {
       setIsLoading(false);
     }
@@ -150,7 +233,6 @@ export default function ReviewAIApp() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // ================= ЭКРАН 1: ПРОДАЮЩИЙ ЛЕНДИНГ (ЕСЛИ НЕ АВТОРИЗОВАН) =================
   if (!user) {
     return (
       <div className="min-h-screen flex flex-col">
@@ -289,7 +371,6 @@ export default function ReviewAIApp() {
           </section>
         </main>
 
-        {/* Модальное окно Входа / Регистрации */}
         {showAuthModal && (
           <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
             <div className="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl relative">
@@ -381,7 +462,6 @@ export default function ReviewAIApp() {
     );
   }
 
-  // ================= ЭКРАН 2: РАБОЧИЙ ЛИЧНЫЙ КАБИНЕТ =================
   return (
     <div className="min-h-screen flex flex-col bg-slate-50 pb-20 sm:pb-0">
       <header className="bg-white border-b border-slate-200 sticky top-0 z-20">
@@ -400,7 +480,10 @@ export default function ReviewAIApp() {
               Осталось: <span className="text-blue-600">{credits}</span>
             </div>
             <button
-              onClick={() => setShowPaywall(true)}
+              onClick={() => {
+                setPaymentError("");
+                setShowPaywall(true);
+              }}
               className="bg-amber-500 hover:bg-amber-600 text-white text-xs sm:text-sm font-semibold px-3 py-1.5 rounded-xl flex items-center gap-1 transition"
             >
               <Crown className="w-4 h-4" /> PRO
@@ -644,23 +727,50 @@ export default function ReviewAIApp() {
               <Crown className="w-8 h-8" />
             </div>
             <h3 className="text-2xl font-extrabold mb-2">Перейдите на тариф PRO</h3>
-            <p className="text-slate-600 text-sm mb-6">
-              Снимите все ограничения: генерируйте безлимитные ответы и анализируйте конкурентов
-              каждый день.
+            <p className="text-slate-600 text-sm mb-4">
+              Оплата через защищённую платёжную форму: выберите валюту, введите данные карты и
+              подтвердите платёж.
             </p>
-            <div className="bg-slate-50 p-4 rounded-2xl mb-6 border border-slate-200">
-              <div className="text-3xl font-extrabold text-slate-900">$19 / месяц</div>
-              <div className="text-xs text-slate-500 mt-1">Отмена в любой момент в 1 клик</div>
+
+            <div className="grid grid-cols-3 gap-2 mb-4">
+              {(["USD", "RUB", "BYN"] as CurrencyOption[]).map((curr) => (
+                <button
+                  key={curr}
+                  type="button"
+                  onClick={() => setCurrency(curr)}
+                  className={`py-2 px-3 rounded-xl text-xs font-bold border transition ${
+                    currency === curr
+                      ? "border-blue-600 bg-blue-50 text-blue-700"
+                      : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                  }`}
+                >
+                  {curr}
+                </button>
+              ))}
             </div>
+
+            <div className="bg-slate-50 p-4 rounded-2xl mb-5 border border-slate-200">
+              <div className="text-3xl font-extrabold text-slate-900">
+                {PRO_PRICES[currency].label}
+              </div>
+              <div className="text-xs text-slate-500 mt-1">
+                Активация происходит после подтверждения платежа сервером
+              </div>
+            </div>
+
+            {paymentError && (
+              <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-xs text-red-600 text-left">
+                {paymentError}
+              </div>
+            )}
+
             <button
-              onClick={() => {
-                setCredits(999);
-                localStorage.setItem("reviewai_credits", "999");
-                setShowPaywall(false);
-              }}
-              className="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3.5 rounded-xl mb-3 transition"
+              onClick={handleStartCheckout}
+              disabled={isPaymentLoading}
+              className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 text-white font-semibold py-3.5 rounded-xl mb-3 transition flex items-center justify-center gap-2"
             >
-              Оплатить и активировать (Тест)
+              <CreditCard className="w-4 h-4" />
+              {isPaymentLoading ? "Переходим к оплате..." : "Перейти к оплате картой"}
             </button>
             <button
               onClick={() => setShowPaywall(false)}
